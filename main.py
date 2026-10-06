@@ -1,7 +1,6 @@
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 import numpy as np
 import pandas as pd
 import requests
@@ -13,14 +12,22 @@ from requests.auth import HTTPBasicAuth
 # LOAD ENVIRONMENT
 # ============================================================
 load_dotenv()
-app = FastAPI(title="Supply Chain Stock Prediction API", version="1.0.0")
+app = FastAPI(
+    title="Supply Chain Stock Prediction API",
+    version="2.0.0"
+)
 # ============================================================
 # S/4HANA CONFIGURATION
 # ============================================================
-S4_BASE_URL = os.getenv("S4_BASE_URL", "http://192.168.8.69:50000").rstrip("/")
+S4_BASE_URL = os.getenv(
+    "S4_BASE_URL",
+    "http://192.168.8.69:50000"
+).rstrip("/")
 S4_USERNAME = os.getenv("S4_USERNAME")
 S4_PASSWORD = os.getenv("S4_PASSWORD")
-VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() == "true"
+VERIFY_SSL = (
+    os.getenv("VERIFY_SSL", "false").lower() == "true"
+)
 # ============================================================
 # SAP AI CORE / TABPFN CONFIGURATION
 # ============================================================
@@ -29,18 +36,30 @@ AICORE_CLIENT_ID = os.getenv("AICORE_CLIENT_ID")
 AICORE_CLIENT_SECRET = os.getenv("AICORE_CLIENT_SECRET")
 AICORE_API_URL = os.getenv("AICORE_API_URL")
 TABPFN_DEPLOYMENT_ID = os.getenv("TABPFN_DEPLOYMENT_ID")
-AICORE_RESOURCE_GROUP = os.getenv("AICORE_RESOURCE_GROUP", "default")
+AICORE_RESOURCE_GROUP = os.getenv(
+    "AICORE_RESOURCE_GROUP",
+    "default"
+)
 # ============================================================
-# S/4 SERVICE PATHS
+# S/4HANA SERVICE PATHS
 # ============================================================
-STOCK_SERVICE = "/sap/opu/odata/sap/" "API_MATERIAL_STOCK_SRV"
-MATERIAL_DOCUMENT_SERVICE = "/sap/opu/odata/sap/" "API_MATERIAL_DOCUMENT_SRV"
-PURCHASE_ORDER_SERVICE = "/sap/opu/odata/sap/" "API_PURCHASEORDER_PROCESS_SRV"
-SALES_ORDER_SERVICE = "/sap/opu/odata/sap/" "API_SALES_ORDER_SRV"
+STOCK_SERVICE = "/sap/opu/odata/sap/API_MATERIAL_STOCK_SRV"
+MATERIAL_DOCUMENT_SERVICE = (
+    "/sap/opu/odata/sap/API_MATERIAL_DOCUMENT_SRV"
+)
+PURCHASE_ORDER_SERVICE = (
+    "/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV"
+)
+SALES_ORDER_SERVICE = "/sap/opu/odata/sap/API_SALES_ORDER_SRV"
 # ============================================================
 # TABPFN FEATURES
 # ============================================================
-FEATURES = ["CurrentStock", "Consumption30D", "IncomingPO", "Demand"]
+FEATURES = [
+    "CurrentStock",
+    "Consumption30D",
+    "IncomingPO",
+    "Demand"
+]
 TARGET = "StockAfter7Days"
 # ============================================================
 # REQUEST MODEL
@@ -49,13 +68,18 @@ class PredictionRequest(BaseModel):
     material: str
     plant: str
 # ============================================================
-# HTTP SESSION FOR S/4
+# S/4 HTTP SESSION
 # ============================================================
 s4_session = requests.Session()
-s4_session.auth = HTTPBasicAuth(S4_USERNAME, S4_PASSWORD)
-s4_session.headers.update({"Accept": "application/json"})
+s4_session.auth = HTTPBasicAuth(
+    S4_USERNAME,
+    S4_PASSWORD
+)
+s4_session.headers.update({
+    "Accept": "application/json"
+})
 # ============================================================
-# HELPER
+# GENERAL HELPERS
 # ============================================================
 def safe_float(value):
     if value is None or value == "":
@@ -67,221 +91,447 @@ def safe_float(value):
 def escape_odata(value):
     return str(value).replace("'", "''")
 # ============================================================
-# GENERIC ODATA CALL
+# SAP DATE PARSER
+#
+# Supports:
+#
+# /Date(1790640000000)/
+#
+# and ISO timestamps.
+# ============================================================
+def parse_sap_date(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    # SAP OData V2 format
+    match = re.search(
+        r"/Date\((-?\d+)(?:[+-]\d+)?\)/",
+        value
+    )
+    if match:
+        milliseconds = int(match.group(1))
+        return datetime.fromtimestamp(
+            milliseconds / 1000,
+            tz=timezone.utc
+        )
+    # ISO format
+    try:
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+# ============================================================
+# GENERIC ODATA GET
 # ============================================================
 def odata_get(service, entity, params=None):
-    url = f"{S4_BASE_URL}" f"{service}/" f"{entity}"
-    response = s4_session.get(url, params=params, verify=VERIFY_SSL, timeout=120)
-    response.raise_for_status()
+    url = (
+        f"{S4_BASE_URL}"
+        f"{service}/"
+        f"{entity}"
+    )
+    response = s4_session.get(
+        url,
+        params=params,
+        verify=VERIFY_SSL,
+        timeout=120
+    )
+    # Better error visibility
+    if not response.ok:
+        raise ValueError(
+            "\nSAP OData request failed\n"
+            f"Status: {response.status_code}\n"
+            f"URL: {response.url}\n"
+            f"Response: {response.text}"
+        )
     data = response.json()
+    # -----------------------------
     # OData V2
+    # -----------------------------
     if "d" in data:
         result = data["d"]
         if isinstance(result, dict):
             if "results" in result:
                 return result["results"]
             return [result]
+    # -----------------------------
     # OData V4
+    # -----------------------------
     if "value" in data:
         return data["value"]
-    raise ValueError("Unsupported OData response format.")
+    raise ValueError(
+        "Unsupported OData response format."
+    )
 # ============================================================
 # 1. CURRENT STOCK
 #
-# Material + Plant ONLY
-# All storage locations included.
+# Material + Plant
+#
+# All storage locations are included.
 # ============================================================
 def get_current_stock(material, plant):
-    material = escape_odata(material)
-    plant = escape_odata(plant)
+    material_filter = escape_odata(material)
+    plant_filter = escape_odata(plant)
     records = odata_get(
         STOCK_SERVICE,
         "A_MatlStkInAcctMod",
         {
-            "$filter": f"Material eq '{material}' " f"and Plant eq '{plant}'",
-            "$format": "json",
-        },
+            "$filter":
+                f"Material eq '{material_filter}' "
+                f"and Plant eq '{plant_filter}'",
+            "$format": "json"
+        }
     )
     total = 0.0
     details = []
     for record in records:
-        quantity = safe_float(record.get("MatlWrhsStkQtyInMatlBaseUnit"))
-        total += quantity
-        details.append(
-            {
-                "StorageLocation": record.get("StorageLocation", ""),
-                "Quantity": quantity,
-                "Unit": record.get("MaterialBaseUnit", ""),
-            }
+        quantity = safe_float(
+            record.get("MatlWrhsStkQtyInMatlBaseUnit")
         )
+        total += quantity
+        details.append({
+            "StorageLocation":
+                record.get("StorageLocation", ""),
+            "Quantity": quantity,
+            "Unit":
+                record.get("MaterialBaseUnit", "")
+        })
     return total, details
 # ============================================================
-# SAP DATE PARSER
-# ============================================================
-def parse_sap_date(value):
-    if not value:
-        return None
-    value = str(value)
-    match = re.search(r"/Date\((-?\d+)", value)
-    if match:
-        milliseconds = int(match.group(1))
-        return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
-# ============================================================
 # 2. MATERIAL MOVEMENTS
+#
+# IMPORTANT:
+#
+# Expand Material Document Header so PostingDate is available.
 # ============================================================
 def get_material_movements(material, plant):
-    material = escape_odata(material)
-    plant = escape_odata(plant)
+    material_filter = escape_odata(material)
+    plant_filter = escape_odata(plant)
     return odata_get(
         MATERIAL_DOCUMENT_SERVICE,
         "A_MaterialDocumentItem",
         {
-            "$filter": f"Material eq '{material}' " f"and Plant eq '{plant}'",
-            "$format": "json",
-        },
+            "$filter":
+                f"Material eq '{material_filter}' "
+                f"and Plant eq '{plant_filter}'",
+            "$expand":
+                "to_MaterialDocumentHeader",
+            "$format": "json"
+        }
     )
 # ============================================================
-# CONSUMPTION MOVEMENTS
+# CONSUMPTION MOVEMENT TYPES
 # ============================================================
-CONSUMPTION_MOVEMENT_TYPES = {"201", "221", "261", "281", "601"}
+CONSUMPTION_MOVEMENT_TYPES = {
+    # Goods issue to cost center
+    "201",
+    # Goods issue to project
+    "221",
+    # Goods issue to production order
+    "261",
+    # Goods issue to network
+    "281",
+    # Goods issue for delivery
+    "601"
+}
 # ============================================================
-# MATERIAL DOCUMENT HEADER
-# ============================================================
-def get_material_document_header(year, document):
-    entity = (
-        "A_MaterialDocumentHeader"
-        f"(MaterialDocumentYear='{year}',"
-        f"MaterialDocument='{document}')"
-    )
-    result = odata_get(MATERIAL_DOCUMENT_SERVICE, entity, {"$format": "json"})
-    if not result:
-        return None
-    return result[0]
-# ============================================================
-# CONSUMPTION FOR LAST 30 DAYS
+# 2A. CONSUMPTION LAST 30 DAYS
+#
+# Window end:
+#   latest (default) = latest consumption posting date
+#                      (for historical demo data)
+#   today            = current date (for live data)
+#
+# Set CONSUMPTION_WINDOW_END=today in .env for live data.
 # ============================================================
 def get_consumption_30d(material, plant):
-    movements = get_material_movements(material, plant)
-    end_date = datetime.now(timezone.utc)
+    movements = get_material_movements(
+        material,
+        plant
+    )
+    # Normalise types so "0261", " 261" and "261" all match
+    consumption_types = {
+        str(t).strip().lstrip("0")
+        for t in CONSUMPTION_MOVEMENT_TYPES
+    }
+    skipped = {
+        "not_consumption_type": 0,
+        "cancelled": 0,
+        "no_posting_date": 0,
+        "invalid_posting_date": 0,
+        "zero_quantity": 0
+    }
+    print("\n====================================")
+    print("CONSUMPTION DEBUG")
+    print("====================================")
+    print("Material:", material, "| Plant:", plant)
+    print("Total movements:", len(movements))
+    print(
+        "Movement types found:",
+        sorted({
+            str(m.get("GoodsMovementType", "")).strip()
+            for m in movements
+        })
+    )
+    header_cache = {}
+    records = []
+    for movement in movements:
+        # ------------------------------------------
+        # Movement Type
+        # ------------------------------------------
+        movement_type = str(
+            movement.get("GoodsMovementType", "")
+        ).strip()
+        if movement_type.lstrip("0") not in consumption_types:
+            skipped["not_consumption_type"] += 1
+            continue
+        # ------------------------------------------
+        # Ignore cancelled documents
+        # ------------------------------------------
+        if str(
+            movement.get("GoodsMovementIsCancelled", "")
+        ).strip().lower() == "true":
+            skipped["cancelled"] += 1
+            continue
+        # ------------------------------------------
+        # Posting Date
+        # 1) item  2) expanded header  3) header call
+        # ------------------------------------------
+        posting_date_raw = movement.get("PostingDate")
+        if not posting_date_raw:
+            header = movement.get(
+                "to_MaterialDocumentHeader"
+            ) or {}
+            if isinstance(header, dict) and "results" in header:
+                header_results = header.get("results") or []
+                header = header_results[0] if header_results else {}
+            posting_date_raw = header.get("PostingDate")
+        if not posting_date_raw:
+            year = str(
+                movement.get("MaterialDocumentYear", "")
+            ).strip()
+            document = str(
+                movement.get("MaterialDocument", "")
+            ).strip()
+            item_no = str(
+                movement.get("MaterialDocumentItem", "")
+            ).strip()
+            cache_key = (year, document)
+            if year and document and item_no:
+                if cache_key not in header_cache:
+                    try:
+                        entity = (
+                            "A_MaterialDocumentItem("
+                            f"MaterialDocumentYear='{escape_odata(year)}',"
+                            f"MaterialDocument='{escape_odata(document)}',"
+                            f"MaterialDocumentItem='{escape_odata(item_no)}'"
+                            ")/to_MaterialDocumentHeader"
+                        )
+                        result = odata_get(
+                            MATERIAL_DOCUMENT_SERVICE,
+                            entity,
+                            {"$format": "json"}
+                        )
+                        header_cache[cache_key] = (
+                            result[0] if result else {}
+                        )
+                    except Exception as exc:
+                        print(
+                            "HEADER ERROR:",
+                            year, document, item_no, str(exc)
+                        )
+                        header_cache[cache_key] = {}
+                posting_date_raw = header_cache[cache_key].get(
+                    "PostingDate"
+                )
+        if not posting_date_raw:
+            skipped["no_posting_date"] += 1
+            continue
+        posting_date = parse_sap_date(posting_date_raw)
+        if posting_date is None:
+            skipped["invalid_posting_date"] += 1
+            print("INVALID POSTING DATE:", posting_date_raw)
+            continue
+        # ------------------------------------------
+        # Quantity
+        # ------------------------------------------
+        quantity = abs(
+            safe_float(movement.get("QuantityInBaseUnit"))
+        )
+        if quantity == 0:
+            skipped["zero_quantity"] += 1
+            continue
+        records.append({
+            "MaterialDocument":
+                movement.get("MaterialDocument"),
+            "MaterialDocumentYear":
+                movement.get("MaterialDocumentYear"),
+            "MaterialDocumentItem":
+                movement.get("MaterialDocumentItem"),
+            "MovementType":
+                movement_type,
+            "PostingDateObject":
+                posting_date,
+            "PostingDate":
+                posting_date.isoformat(),
+            "StorageLocation":
+                movement.get("StorageLocation", ""),
+            "Quantity":
+                quantity,
+            "Unit":
+                movement.get("MaterialBaseUnit", "")
+        })
+    print("Skipped summary:", skipped)
+    print("Valid consumption movements:", len(records))
+    if not records:
+        print("Consumption30D = 0 (no valid consumption movements)")
+        print("====================================")
+        return 0.0, []
+    # ----------------------------------------------
+    # Window end
+    # ----------------------------------------------
+    window_mode = os.getenv(
+        "CONSUMPTION_WINDOW_END",
+        "latest"
+    ).strip().lower()
+    if window_mode == "today":
+        end_date = datetime.now(timezone.utc)
+    else:
+        end_date = max(
+            r["PostingDateObject"] for r in records
+        )
     start_date = end_date - timedelta(days=30)
+    print("Window mode:", window_mode)
+    print("Window:", start_date.date(), "->", end_date.date())
+    # ----------------------------------------------
+    # Sum last 30 days
+    # ----------------------------------------------
     total = 0.0
     details = []
-    header_cache = {}
-    for movement in movements:
-        movement_type = str(movement.get("GoodsMovementType", ""))
-        # Only consumption movements
-        if movement_type not in CONSUMPTION_MOVEMENT_TYPES:
+    for record in records:
+        posting_date = record["PostingDateObject"]
+        if posting_date < start_date or posting_date > end_date:
             continue
-        # Ignore cancelled movement
-        if movement.get("GoodsMovementIsCancelled") is True:
-            continue
-        document = str(movement.get("MaterialDocument", ""))
-        year = str(movement.get("MaterialDocumentYear", ""))
-        if not document or not year:
-            continue
-        key = (year, document)
-        if key not in header_cache:
-            header_cache[key] = get_material_document_header(year, document)
-        header = header_cache[key]
-        if not header:
-            continue
-        posting_date = parse_sap_date(header.get("PostingDate"))
-        if posting_date is None:
-            continue
-        if not (start_date <= posting_date <= end_date):
-            continue
-        quantity = abs(safe_float(movement.get("QuantityInBaseUnit")))
-        total += quantity
-        details.append(
-            {
-                "MaterialDocument": document,
-                "MovementType": movement_type,
-                "PostingDate": posting_date.isoformat(),
-                "StorageLocation": movement.get("StorageLocation", ""),
-                "Quantity": quantity,
-            }
-        )
-    return total, details
+        total += record["Quantity"]
+        details.append({
+            key: value
+            for key, value in record.items()
+            if key != "PostingDateObject"
+        })
+    print("Consumption30D:", total)
+    print("Transactions counted:", len(details))
+    print("====================================")
+    return round(total, 3), details
 # ============================================================
 # 3. OPEN PURCHASE ORDERS
 #
-# Material + Plant only.
-# All storage locations.
+# CURRENT IMPLEMENTATION:
+#
+# Material + Plant
+#
+# Includes all storage locations.
+#
+# NOTE:
+# This currently uses OrderQuantity.
+#
+# Later we can improve this to:
+# IncomingPO7D using PO Schedule Lines.
 # ============================================================
 def get_open_purchase_orders(material, plant):
-    material = escape_odata(material)
-    plant = escape_odata(plant)
+    material_filter = escape_odata(material)
+    plant_filter = escape_odata(plant)
     records = odata_get(
         PURCHASE_ORDER_SERVICE,
         "A_PurchaseOrderItem",
         {
-            "$filter": f"Material eq '{material}' " f"and Plant eq '{plant}'",
-            "$expand": "to_PurchaseOrder",
-            "$format": "json",
-        },
+            "$filter":
+                f"Material eq '{material_filter}' "
+                f"and Plant eq '{plant_filter}'",
+            "$expand":
+                "to_PurchaseOrder",
+            "$format": "json"
+        }
     )
     total = 0.0
     details = []
     for item in records:
-        # Deleted
+        # Deleted PO item
         if item.get("PurchasingDocumentDeletionCode"):
             continue
-        # Already completely delivered
+        # Completely delivered
         if item.get("IsCompletelyDelivered") is True:
             continue
-        # GR not expected
+        # Goods receipt not expected
         if item.get("GoodsReceiptIsExpected") is not True:
             continue
-        # Return item
+        # Return PO
         if item.get("IsReturnsItem") is True:
             continue
         quantity = safe_float(item.get("OrderQuantity"))
+        if quantity <= 0:
+            continue
         total += quantity
-        header = item.get("to_PurchaseOrder", {})
-        details.append(
-            {
-                "PurchaseOrder": item.get("PurchaseOrder"),
-                "PurchaseOrderItem": item.get("PurchaseOrderItem"),
-                "StorageLocation": item.get("StorageLocation", ""),
-                "Quantity": quantity,
-                "Unit": item.get("PurchaseOrderQuantityUnit", ""),
-                "Supplier": header.get("Supplier", ""),
-            }
-        )
+        header = item.get("to_PurchaseOrder") or {}
+        # Handle expanded relationship
+        if isinstance(header, dict) and "results" in header:
+            header_results = header.get("results") or []
+            header = (
+                header_results[0]
+                if header_results
+                else {}
+            )
+        details.append({
+            "PurchaseOrder":
+                item.get("PurchaseOrder"),
+            "PurchaseOrderItem":
+                item.get("PurchaseOrderItem"),
+            "StorageLocation":
+                item.get("StorageLocation", ""),
+            "Quantity":
+                quantity,
+            "Unit":
+                item.get("PurchaseOrderQuantityUnit", ""),
+            "Supplier":
+                header.get("Supplier", "")
+        })
     return total, details
 # ============================================================
 # 4. SALES ORDER DEMAND
+#
+# IMPORTANT:
+#
+# Sales Order API uses:
+#
+# ProductionPlant
+#
+# NOT:
+#
+# Plant
 # ============================================================
 def get_sales_demand(material, plant):
-    material = escape_odata(material)
-    plant = escape_odata(plant)
- 
+    material_filter = escape_odata(material)
+    plant_filter = escape_odata(plant)
     records = odata_get(
         SALES_ORDER_SERVICE,
         "A_SalesOrderItem",
         {
             "$filter":
-                f"Material eq '{material}' "
-                f"and ProductionPlant eq '{plant}'",
+                f"Material eq '{material_filter}' "
+                f"and ProductionPlant eq "
+                f"'{plant_filter}'",
             "$format": "json"
         }
     )
-
     total_demand = 0.0
     details = []
-
     for item in records:
-        # Ignore rejected sales order items
+        # Ignore rejected items
         if item.get("SalesDocumentRjcnReason"):
             continue
-        # Ignore completely processed/delivered items
+        # Ignore completed items
         if (
             item.get("SDProcessStatus") == "C"
             or item.get("DeliveryStatus") == "C"
@@ -290,58 +540,102 @@ def get_sales_demand(material, plant):
         requested_qty = safe_float(
             item.get("RequestedQuantity")
         )
-
-        # Active requested quantity is demand
-        demand_qty = requested_qty
-        if demand_qty <= 0:
+        if requested_qty <= 0:
             continue
+        # ------------------------------------------
+        # Current demand logic
+        #
+        # IMPORTANT:
+        #
+        # Do NOT use:
+        #
+        # requested - confirmed
+        #
+        # because confirmed quantity can still
+        # represent future customer requirement.
+        # ------------------------------------------
+        demand_qty = requested_qty
         total_demand += demand_qty
-
         details.append({
-            "SalesOrder": item.get("SalesOrder"),
-            "SalesOrderItem": item.get("SalesOrderItem"),
-            "Material": item.get("Material"),
-            "Plant": item.get("ProductionPlant"),
-            "RequestedQuantity": requested_qty,
-            "ConfirmedQuantity": safe_float(
-                item.get("ConfdDelivQtyInOrderQtyUnit")
-            ),
-            "DemandQuantity": demand_qty,
-            "Unit": item.get("RequestedQuantityUnit"),
-            "SDProcessStatus": item.get("SDProcessStatus"),
-            "DeliveryStatus": item.get("DeliveryStatus")
+            "SalesOrder":
+                item.get("SalesOrder"),
+            "SalesOrderItem":
+                item.get("SalesOrderItem"),
+            "Material":
+                item.get("Material"),
+            "Plant":
+                item.get("ProductionPlant"),
+            "RequestedQuantity":
+                requested_qty,
+            "ConfirmedQuantity":
+                safe_float(
+                    item.get("ConfdDelivQtyInOrderQtyUnit")
+                ),
+            "DemandQuantity":
+                demand_qty,
+            "Unit":
+                item.get("RequestedQuantityUnit"),
+            "SDProcessStatus":
+                item.get("SDProcessStatus"),
+            "DeliveryStatus":
+                item.get("DeliveryStatus")
         })
- 
     return total_demand, details
-
 # ============================================================
-# COLLECT CURRENT FEATURES
+# 5. COLLECT CURRENT FEATURES
 # ============================================================
 def collect_current_features(material, plant):
-    current_stock, stock_details = get_current_stock(material, plant)
-    consumption, consumption_details = get_consumption_30d(material, plant)
-    incoming_po, po_details = get_open_purchase_orders(material, plant)
-    demand, demand_details = get_sales_demand(material, plant)
+    # Current Stock
+    (
+        current_stock,
+        stock_details
+    ) = get_current_stock(material, plant)
+    # Consumption
+    (
+        consumption,
+        consumption_details
+    ) = get_consumption_30d(material, plant)
+    # Incoming PO
+    (
+        incoming_po,
+        po_details
+    ) = get_open_purchase_orders(material, plant)
+    # Demand
+    (
+        demand,
+        demand_details
+    ) = get_sales_demand(material, plant)
     features = {
-        "CurrentStock": current_stock,
-        "Consumption30D": consumption,
-        "IncomingPO": incoming_po,
-        "Demand": demand,
+        "CurrentStock":
+            current_stock,
+        "Consumption30D":
+            consumption,
+        "IncomingPO":
+            incoming_po,
+        "Demand":
+            demand
     }
     details = {
-        "Stock": stock_details,
-        "Consumption": consumption_details,
-        "OpenPO": po_details,
-        "Demand": demand_details,
+        "Stock":
+            stock_details,
+        "Consumption":
+            consumption_details,
+        "OpenPO":
+            po_details,
+        "Demand":
+            demand_details
     }
     return features, details
 # ============================================================
-# HISTORICAL DATA
+# 6. HISTORICAL DATA
 #
 # IMPORTANT:
-# These rows are ONLY temporary for pipeline testing.
 #
-# Replace this function with real SAP historical data.
+# TEMPORARY TEST DATA ONLY.
+#
+# DO NOT consider final TabPFN prediction
+# business-valid until this is replaced
+# with real historical SAP observations.
 # ============================================================
 def build_historical_dataset():
     rows = [
@@ -354,7 +648,7 @@ def build_historical_dataset():
         [800, 1200, 200, 900, 500],
         [600, 1300, 100, 1000, 300],
         [400, 1400, 50, 1100, 150],
-        [200, 1500, 0, 1200, 0],
+        [200, 1500, 0, 1200, 0]
     ]
     return pd.DataFrame(
         rows,
@@ -363,97 +657,159 @@ def build_historical_dataset():
             "Consumption30D",
             "IncomingPO",
             "Demand",
-            "StockAfter7Days",
-        ],
+            "StockAfter7Days"
+        ]
     )
 # ============================================================
-# GET SAP AI CORE ACCESS TOKEN
+# 7. SAP AI CORE ACCESS TOKEN
 # ============================================================
 def get_aicore_access_token():
-    required = [AICORE_AUTH_URL, AICORE_CLIENT_ID, AICORE_CLIENT_SECRET]
+    required = [
+        AICORE_AUTH_URL,
+        AICORE_CLIENT_ID,
+        AICORE_CLIENT_SECRET
+    ]
     if not all(required):
-        raise ValueError("SAP AI Core credentials are missing.")
+        raise ValueError(
+            "SAP AI Core credentials are missing."
+        )
     response = requests.post(
-        f"{AICORE_AUTH_URL.rstrip('/')}/oauth/token",
-        data={"grant_type": "client_credentials"},
-        auth=(AICORE_CLIENT_ID, AICORE_CLIENT_SECRET),
-        timeout=60,
+        f"{AICORE_AUTH_URL.rstrip('/')}"
+        f"/oauth/token",
+        data={
+            "grant_type": "client_credentials"
+        },
+        auth=(
+            AICORE_CLIENT_ID,
+            AICORE_CLIENT_SECRET
+        ),
+        timeout=60
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise ValueError(
+            "AI Core authentication failed.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
     token = response.json().get("access_token")
     if not token:
-        raise ValueError("Access token missing.")
+        raise ValueError(
+            "AI Core access token missing."
+        )
     return token
 # ============================================================
-# GET TABPFN DEPLOYMENT URL
+# 8. GET TABPFN DEPLOYMENT URL
 # ============================================================
 def get_tabpfn_deployment_url(access_token):
     if not AICORE_API_URL:
-        raise ValueError("AICORE_API_URL missing.")
+        raise ValueError(
+            "AICORE_API_URL is missing."
+        )
     if not TABPFN_DEPLOYMENT_ID:
-        raise ValueError("TABPFN_DEPLOYMENT_ID missing.")
+        raise ValueError(
+            "TABPFN_DEPLOYMENT_ID is missing."
+        )
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "AI-Resource-Group": AICORE_RESOURCE_GROUP,
+        "Authorization":
+            f"Bearer {access_token}",
+        "AI-Resource-Group":
+            AICORE_RESOURCE_GROUP
     }
-    url = f"{AICORE_API_URL.rstrip('/')}" f"/lm/deployments/" f"{TABPFN_DEPLOYMENT_ID}"
-    response = requests.get(url, headers=headers, timeout=60)
-    response.raise_for_status()
+    url = (
+        f"{AICORE_API_URL.rstrip('/')}"
+        f"/lm/deployments/"
+        f"{TABPFN_DEPLOYMENT_ID}"
+    )
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=60
+    )
+    if not response.ok:
+        raise ValueError(
+            "Unable to get TabPFN deployment.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
     deployment_url = response.json().get("deploymentUrl")
     if not deployment_url:
-        raise ValueError("TabPFN deployment URL missing. " "Check deployment status.")
+        raise ValueError(
+            "TabPFN deployment URL missing. "
+            "Check deployment status."
+        )
     return deployment_url
 # ============================================================
-# CALL DEPLOYED TABPFN MODEL
+# 9. CALL DEPLOYED TABPFN
 # ============================================================
 def call_tabpfn(X_train, y_train, X_test):
-    # --------------------------------------------------------
-    # Same deployment concept as your Titanic code.
-    # --------------------------------------------------------
+    # TabPFN regression payload
     payload = {
         "task_config": {
             "task": "regression",
-            "tabpfn_config": {"n_estimators": 8, "random_state": 0},
-            "predict_params": {"output_type": "median"},
+            "tabpfn_config": {
+                "n_estimators": 8,
+                "random_state": 0
+            },
+            "predict_params": {
+                "output_type": "median"
+            }
         },
-        "x_train": X_train.to_numpy(dtype=float).tolist(),
-        "y_train": y_train.to_numpy(dtype=float).tolist(),
-        "x_test": X_test.to_numpy(dtype=float).tolist(),
+        "x_train":
+            X_train.to_numpy(dtype=float).tolist(),
+        "y_train":
+            y_train.to_numpy(dtype=float).tolist(),
+        "x_test":
+            X_test.to_numpy(dtype=float).tolist()
     }
-    # --------------------------------------------------------
     # Authenticate
-    # --------------------------------------------------------
     access_token = get_aicore_access_token()
-    # --------------------------------------------------------
-    # Deployment ID -> Deployment URL
-    # --------------------------------------------------------
-    deployment_url = get_tabpfn_deployment_url(access_token)
+    # Deployment ID -> URL
+    deployment_url = get_tabpfn_deployment_url(
+        access_token
+    )
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "AI-Resource-Group": AICORE_RESOURCE_GROUP,
-        "Content-Type": "application/json",
+        "Authorization":
+            f"Bearer {access_token}",
+        "AI-Resource-Group":
+            AICORE_RESOURCE_GROUP,
+        "Content-Type":
+            "application/json"
     }
-    # --------------------------------------------------------
     # Prediction
-    # --------------------------------------------------------
     response = requests.post(
-        f"{deployment_url.rstrip('/')}/predict",
+        f"{deployment_url.rstrip('/')}"
+        f"/predict",
         headers=headers,
         json=payload,
-        timeout=300,
+        timeout=300
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise ValueError(
+            "TabPFN prediction failed.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
     output = response.json()
     if "prediction" not in output:
-        raise ValueError("TabPFN response does not " "contain 'prediction'.")
-    predictions = np.asarray(output["prediction"], dtype=float).reshape(-1)
+        raise ValueError(
+            "TabPFN response does not "
+            "contain 'prediction'."
+        )
+    predictions = np.asarray(
+        output["prediction"],
+        dtype=float
+    ).reshape(-1)
     if len(predictions) == 0:
-        raise ValueError("TabPFN returned no prediction.")
+        raise ValueError(
+            "TabPFN returned no prediction."
+        )
     if not np.isfinite(predictions).all():
-        raise ValueError("TabPFN returned invalid prediction.")
+        raise ValueError(
+            "TabPFN returned invalid prediction."
+        )
     return predictions
 # ============================================================
-# HEALTH ENDPOINT
+# 10. HEALTH ENDPOINT
 # ============================================================
 @app.get("/health")
 def health():
@@ -461,94 +817,139 @@ def health():
         "status": "ok",
         "model": "TabPFN",
         "mode": "SAP AI Core Deployment",
-        "deploymentConfigured": bool(TABPFN_DEPLOYMENT_ID),
+        "deploymentConfigured":
+            bool(TABPFN_DEPLOYMENT_ID)
     }
 # ============================================================
-# CURRENT FEATURES ENDPOINT
+# 11. CURRENT FEATURES ENDPOINT
+#
+# TEST THIS FIRST.
 # ============================================================
 @app.post("/current-features")
 def current_features(request: PredictionRequest):
     try:
-        features, details = collect_current_features(request.material, request.plant)
+        (
+            features,
+            details
+        ) = collect_current_features(
+            request.material,
+            request.plant
+        )
         return {
-            "Material": request.material,
-            "Plant": request.plant,
-            "Features": features,
-            "Details": details,
+            "Material":
+                request.material,
+            "Plant":
+                request.plant,
+            "Features":
+                features,
+            "Details":
+                details
         }
+    except requests.Timeout as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="SAP request timed out."
+        ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        ) from exc
 # ============================================================
-# STOCK PREDICTION
+# 12. STOCK PREDICTION ENDPOINT
 # ============================================================
 @app.post("/predict-stock-7d")
 def predict_stock_7d(request: PredictionRequest):
     try:
-        # ----------------------------------------------------
-        # STEP 1
-        # Get current data from S/4HANA
-        # ----------------------------------------------------
-        current_features, details = collect_current_features(
-            request.material, request.plant
+        # STEP 1: Get current S/4HANA data
+        (
+            current_features,
+            details
+        ) = collect_current_features(
+            request.material,
+            request.plant
         )
-        # ----------------------------------------------------
-        # STEP 2
-        # Historical dataset
-        # ----------------------------------------------------
+        # STEP 2: Historical TabPFN context
         history = build_historical_dataset()
-        # ----------------------------------------------------
-        # STEP 3
-        # Prepare TabPFN training/context data
-        # ----------------------------------------------------
+        if history.empty:
+            raise ValueError(
+                "Historical dataset is empty."
+            )
+        # STEP 3: X train / Y train
         X_train = history[FEATURES].astype(float)
         y_train = history[TARGET].astype(float)
-        # ----------------------------------------------------
-        # STEP 4
-        # Current row becomes x_test
-        # ----------------------------------------------------
-        X_test = pd.DataFrame([current_features], columns=FEATURES).astype(float)
-        # ----------------------------------------------------
-        # STEP 5
-        # Call deployed TabPFN
-        # ----------------------------------------------------
-        predictions = call_tabpfn(X_train, y_train, X_test)
-        predicted_stock = max(0.0, float(predictions[0]))
-        # ----------------------------------------------------
-        # STEP 6
-        # Response
-        # ----------------------------------------------------
+        # STEP 4: Current SAP row becomes X_test
+        X_test = pd.DataFrame(
+            [current_features],
+            columns=FEATURES
+        ).astype(float)
+        # STEP 5: Call TabPFN on SAP AI Core
+        predictions = call_tabpfn(
+            X_train,
+            y_train,
+            X_test
+        )
+        predicted_stock = max(
+            0.0,
+            float(predictions[0])
+        )
+        # STEP 6: Return response
         return {
             "status": "success",
             "model": "TabPFN",
             "modelSource": "SAP AI Core Deployment",
-            "Material": request.material,
-            "Plant": request.plant,
+            "Material":
+                request.material,
+            "Plant":
+                request.plant,
             "Input": {
-                "CurrentStock": current_features["CurrentStock"],
-                "Consumption30D": current_features["Consumption30D"],
-                "IncomingPO": current_features["IncomingPO"],
-                "Demand": current_features["Demand"],
+                "CurrentStock":
+                    current_features["CurrentStock"],
+                "Consumption30D":
+                    current_features["Consumption30D"],
+                "IncomingPO":
+                    current_features["IncomingPO"],
+                "Demand":
+                    current_features["Demand"]
             },
             "Prediction": {
                 "HorizonDays": 7,
-                "PredictedStock": round(predicted_stock, 2),
+                "PredictedStock":
+                    round(predicted_stock, 2)
             },
-            "Details": details,
+            "Details":
+                details,
+            # Important reminder while testing
+            "PredictionDataStatus":
+                "TEMPORARY_HISTORICAL_DATA"
         }
     except requests.Timeout as exc:
         raise HTTPException(
-            status_code=504, detail=("SAP or TabPFN request timed out.")
+            status_code=504,
+            detail="SAP or TabPFN request timed out."
         ) from exc
     except requests.RequestException as exc:
         raise HTTPException(
-            status_code=502, detail=("SAP/AI Core request failed: " f"{str(exc)}")
+            status_code=502,
+            detail=(
+                "SAP/AI Core request failed: "
+                f"{str(exc)}"
+            )
         ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        ) from exc
+# ============================================================
 # MAIN
 # ============================================================
 def main():
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=int(os.getenv("PORT", "8000"))
+    )
 if __name__ == "__main__":
     main()
