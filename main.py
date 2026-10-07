@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from requests.auth import HTTPBasicAuth
+
 # ============================================================
 # LOAD ENVIRONMENT
 # ============================================================
@@ -16,6 +17,7 @@ app = FastAPI(
     title="Supply Chain Stock Prediction API",
     version="2.0.0"
 )
+
 # ============================================================
 # S/4HANA CONFIGURATION
 # ============================================================
@@ -28,6 +30,7 @@ S4_PASSWORD = os.getenv("S4_PASSWORD")
 VERIFY_SSL = (
     os.getenv("VERIFY_SSL", "false").lower() == "true"
 )
+
 # ============================================================
 # SAP AI CORE / TABPFN CONFIGURATION
 # ============================================================
@@ -40,6 +43,7 @@ AICORE_RESOURCE_GROUP = os.getenv(
     "AICORE_RESOURCE_GROUP",
     "default"
 )
+
 # ============================================================
 # S/4HANA SERVICE PATHS
 # ============================================================
@@ -51,6 +55,7 @@ PURCHASE_ORDER_SERVICE = (
     "/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV"
 )
 SALES_ORDER_SERVICE = "/sap/opu/odata/sap/API_SALES_ORDER_SRV"
+
 # ============================================================
 # TABPFN FEATURES
 # ============================================================
@@ -61,12 +66,14 @@ FEATURES = [
     "Demand"
 ]
 TARGET = "StockAfter7Days"
+
 # ============================================================
 # REQUEST MODEL
 # ============================================================
 class PredictionRequest(BaseModel):
     material: str
     plant: str
+
 # ============================================================
 # S/4 HTTP SESSION
 # ============================================================
@@ -78,6 +85,7 @@ s4_session.auth = HTTPBasicAuth(
 s4_session.headers.update({
     "Accept": "application/json"
 })
+
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
@@ -88,42 +96,50 @@ def safe_float(value):
         return float(value)
     except (ValueError, TypeError):
         return 0.0
+
 def escape_odata(value):
     return str(value).replace("'", "''")
+
 # ============================================================
 # SAP DATE PARSER
-#
 # Supports:
-#
 # /Date(1790640000000)/
-#
 # and ISO timestamps.
 # ============================================================
 def parse_sap_date(value):
-    if not value:
+    """
+    Parse SAP OData V2 /Date(...)/ or ISO dates.
+    Missing/invalid dates return None so one incomplete SAP row
+    does not stop the entire stock prediction.
+    """
+    if value is None or str(value).strip() == "":
         return None
+
     value = str(value).strip()
-    # SAP OData V2 format
     match = re.search(
         r"/Date\((-?\d+)(?:[+-]\d+)?\)/",
         value
     )
+
     if match:
-        milliseconds = int(match.group(1))
-        return datetime.fromtimestamp(
-            milliseconds / 1000,
-            tz=timezone.utc
-        )
-    # ISO format
+        try:
+            milliseconds = int(match.group(1))
+            return datetime.fromtimestamp(
+                milliseconds / 1000,
+                tz=timezone.utc
+            )
+        except (ValueError, OverflowError, OSError):
+            return None
+
     try:
-        dt = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except (ValueError, TypeError):
         return None
+
+
 # ============================================================
 # GENERIC ODATA GET
 # ============================================================
@@ -165,11 +181,10 @@ def odata_get(service, entity, params=None):
     raise ValueError(
         "Unsupported OData response format."
     )
+
 # ============================================================
 # 1. CURRENT STOCK
-#
 # Material + Plant
-#
 # All storage locations are included.
 # ============================================================
 def get_current_stock(material, plant):
@@ -200,11 +215,10 @@ def get_current_stock(material, plant):
                 record.get("MaterialBaseUnit", "")
         })
     return total, details
+
 # ============================================================
 # 2. MATERIAL MOVEMENTS
-#
 # IMPORTANT:
-#
 # Expand Material Document Header so PostingDate is available.
 # ============================================================
 def get_material_movements(material, plant):
@@ -222,6 +236,7 @@ def get_material_movements(material, plant):
             "$format": "json"
         }
     )
+
 # ============================================================
 # CONSUMPTION MOVEMENT TYPES
 # ============================================================
@@ -237,14 +252,13 @@ CONSUMPTION_MOVEMENT_TYPES = {
     # Goods issue for delivery
     "601"
 }
+
 # ============================================================
 # 2A. CONSUMPTION LAST 30 DAYS
-#
 # Window end:
 #   latest (default) = latest consumption posting date
 #                      (for historical demo data)
 #   today            = current date (for live data)
-#
 # Set CONSUMPTION_WINDOW_END=today in .env for live data.
 # ============================================================
 def get_consumption_30d(material, plant):
@@ -425,18 +439,14 @@ def get_consumption_30d(material, plant):
     print("Transactions counted:", len(details))
     print("====================================")
     return round(total, 3), details
+
 # ============================================================
 # 3. OPEN PURCHASE ORDERS
-#
 # CURRENT IMPLEMENTATION:
-#
 # Material + Plant
-#
 # Includes all storage locations.
-#
 # NOTE:
 # This currently uses OrderQuantity.
-#
 # Later we can improve this to:
 # IncomingPO7D using PO Schedule Lines.
 # ============================================================
@@ -498,17 +508,13 @@ def get_open_purchase_orders(material, plant):
                 header.get("Supplier", "")
         })
     return total, details
+
 # ============================================================
 # 4. SALES ORDER DEMAND
-#
 # IMPORTANT:
-#
 # Sales Order API uses:
-#
 # ProductionPlant
-#
 # NOT:
-#
 # Plant
 # ============================================================
 def get_sales_demand(material, plant):
@@ -544,13 +550,9 @@ def get_sales_demand(material, plant):
             continue
         # ------------------------------------------
         # Current demand logic
-        #
         # IMPORTANT:
-        #
         # Do NOT use:
-        #
         # requested - confirmed
-        #
         # because confirmed quantity can still
         # represent future customer requirement.
         # ------------------------------------------
@@ -581,6 +583,7 @@ def get_sales_demand(material, plant):
                 item.get("DeliveryStatus")
         })
     return total_demand, details
+
 # ============================================================
 # 5. COLLECT CURRENT FEATURES
 # ============================================================
@@ -626,40 +629,114 @@ def collect_current_features(material, plant):
             demand_details
     }
     return features, details
+
 # ============================================================
 # 6. HISTORICAL DATA
-#
 # IMPORTANT:
-#
 # TEMPORARY TEST DATA ONLY.
-#
 # DO NOT consider final TabPFN prediction
 # business-valid until this is replaced
 # with real historical SAP observations.
 # ============================================================
-def build_historical_dataset():
-    rows = [
-        [2000, 600, 500, 300, 1800],
-        [1800, 700, 400, 400, 1600],
-        [1600, 800, 300, 500, 1400],
-        [1400, 900, 400, 600, 1200],
-        [1200, 1000, 300, 700, 900],
-        [1000, 1100, 200, 800, 700],
-        [800, 1200, 200, 900, 500],
-        [600, 1300, 100, 1000, 300],
-        [400, 1400, 50, 1100, 150],
-        [200, 1500, 0, 1200, 0]
+TRAINING_CSV_PATH = os.getenv(
+    "TRAINING_CSV_PATH",
+    "stockout_training_dummy_1050.csv"
+)
+
+def resolve_training_csv_path():
+    """Find the training CSV without depending on a numbered upload filename."""
+    candidates = [
+        TRAINING_CSV_PATH,
+        "stockout_training_dummy_1050.csv",
     ]
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "CurrentStock",
-            "Consumption30D",
-            "IncomingPO",
-            "Demand",
-            "StockAfter7Days"
-        ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    raise ValueError(
+        "Training CSV not found. Set TRAINING_CSV_PATH in .env or keep "
+        "stockout_training_dummy_1050.csv beside app.py."
     )
+
+def build_historical_dataset():
+    """
+    Load the supplied dummy CSV for TabPFN training.
+
+    CSV columns:
+      CurrentStock
+      Consumption30D
+      IncomingPO7D
+      Demand7D
+      StockAfter7D
+
+    The old working S/4 code produces:
+      CurrentStock
+      Consumption30D
+      IncomingPO
+      Demand
+
+    Therefore IncomingPO7D -> IncomingPO and Demand7D -> Demand are mapped
+    before building X_train. CSV Date is not required for prediction.
+    """
+    csv_path = resolve_training_csv_path()
+    history = pd.read_csv(csv_path)
+
+    csv_required = [
+        "CurrentStock",
+        "Consumption30D",
+        "IncomingPO7D",
+        "Demand7D",
+        "StockAfter7D",
+    ]
+
+    missing = [c for c in csv_required if c not in history.columns]
+    if missing:
+        raise ValueError(
+            "Training CSV missing required columns: " + ", ".join(missing)
+        )
+
+    # Use only TRAIN rows when DataSplit exists.
+    if "DataSplit" in history.columns:
+        split = history["DataSplit"].astype(str).str.strip().str.upper()
+        train_rows = history[split == "TRAIN"].copy()
+        if not train_rows.empty:
+            history = train_rows
+
+    # Map CSV feature names to the names used by the old working API.
+    history = history.rename(
+        columns={
+            "IncomingPO7D": "IncomingPO",
+            "Demand7D": "Demand",
+            "StockAfter7D": "StockAfter7Days",
+        }
+    )
+
+    required = FEATURES + [TARGET]
+    for column in required:
+        history[column] = pd.to_numeric(
+            history[column],
+            errors="coerce"
+        )
+
+    history = history.replace([np.inf, -np.inf], np.nan)
+    history = history.dropna(subset=required).reset_index(drop=True)
+
+    if len(history) < 20:
+        raise ValueError(
+            f"Training CSV has only {len(history)} usable TRAIN rows."
+        )
+
+    print("\n====================================")
+    print("CSV TRAINING DATA")
+    print("====================================")
+    print("CSV:", csv_path)
+    print("Training rows:", len(history))
+    print("Features:", FEATURES)
+    print("Target:", TARGET)
+    print("NOTE: CSV Date is not used by TabPFN prediction.")
+    print("====================================")
+
+    return history
+
 # ============================================================
 # 7. SAP AI CORE ACCESS TOKEN
 # ============================================================
@@ -697,6 +774,7 @@ def get_aicore_access_token():
             "AI Core access token missing."
         )
     return token
+
 # ============================================================
 # 8. GET TABPFN DEPLOYMENT URL
 # ============================================================
@@ -738,6 +816,7 @@ def get_tabpfn_deployment_url(access_token):
             "Check deployment status."
         )
     return deployment_url
+
 # ============================================================
 # 9. CALL DEPLOYED TABPFN
 # ============================================================
@@ -808,6 +887,7 @@ def call_tabpfn(X_train, y_train, X_test):
             "TabPFN returned invalid prediction."
         )
     return predictions
+
 # ============================================================
 # 10. HEALTH ENDPOINT
 # ============================================================
@@ -820,9 +900,9 @@ def health():
         "deploymentConfigured":
             bool(TABPFN_DEPLOYMENT_ID)
     }
+
 # ============================================================
 # 11. CURRENT FEATURES ENDPOINT
-#
 # TEST THIS FIRST.
 # ============================================================
 @app.post("/current-features")
@@ -855,6 +935,7 @@ def current_features(request: PredictionRequest):
             status_code=500,
             detail=str(exc)
         ) from exc
+
 # ============================================================
 # 12. STOCK PREDICTION ENDPOINT
 # ============================================================
@@ -941,6 +1022,7 @@ def predict_stock_7d(request: PredictionRequest):
             status_code=500,
             detail=str(exc)
         ) from exc
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -951,5 +1033,6 @@ def main():
         host="127.0.0.1",
         port=int(os.getenv("PORT", "8000"))
     )
+
 if __name__ == "__main__":
     main()
